@@ -1,0 +1,13 @@
+# Python compiled files
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+
+# pyenv version file (optional to include)
+.python-version
+
+# macOS junk
+.DS_Store
