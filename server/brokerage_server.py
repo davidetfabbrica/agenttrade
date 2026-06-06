@@ -31,6 +31,7 @@ from shared.config import (
     AGENT_PRIVATE_KEY,
 )
 from data.market_prices import get_price
+from data.portfolio_store import get_portfolio, update_position, get_position_count
 
 # ── Flask app setup ───────────────────────────────────────────
 # Flask(__name__) creates the application object.
@@ -248,6 +249,8 @@ def execute_trade():
 
     # Generate a unique trade reference number
     trade_ref = f"TRD-{str(uuid.uuid4())[:8].upper()}"
+    # Update the portfolio store with the filled trade
+    update_position(ticker, direction, quantity, fill_price)
 
     # Build the confirmation response
     confirmation = {
@@ -278,6 +281,94 @@ def execute_trade():
 #
 # debug=True means Flask will auto-reload if you change the code,
 # and show detailed error pages. Never use debug=True in production.
+
+# ── Endpoint: GET /portfolio ──────────────────────────────────
+# The agent pays to retrieve its current holdings.
+# Same x402 flow as trade execution — 402 first, then verify.
+@app.route("/portfolio", methods=["GET"])
+def portfolio():
+    """
+    Returns the agent's current portfolio holdings.
+    Gated behind the same x402 payment flow as trade execution.
+
+    The fee for a portfolio query is half the trade fee —
+    a realistic distinction between data access and execution.
+    """
+    PORTFOLIO_FEE = round(TRADE_FEE / 2, 2)  # $0.25 USDC
+
+    payment_header = request.headers.get("X-Payment")
+
+    # ── No payment — issue 402 ────────────────────────────────
+    if not payment_header:
+        nonce = generate_nonce()
+
+        payment_required_response = {
+            "x402_version": 1,
+            "status_code":  402,
+            "message":      "Payment required to access portfolio data",
+            "fee":          PORTFOLIO_FEE,
+            "currency":     FEE_CURRENCY,
+            "recipient":    BROKERAGE_WALLET_ADDRESS,
+            "nonce":        nonce,
+            "instructions": (
+                "Sign the payment payload and retry with the signature "
+                "in the X-Payment header as a JSON string."
+            ),
+        }
+
+        print(f"\n[Server] 402 issued for portfolio request | Nonce: {nonce}")
+        return jsonify(payment_required_response), 402
+
+    # ── Payment present — verify it ───────────────────────────
+    try:
+        payment_proof = json.loads(payment_header)
+    except json.JSONDecodeError:
+        return jsonify({"error": "X-Payment header is not valid JSON"}), 400
+
+    if "payload" not in payment_proof or "signature" not in payment_proof:
+        return jsonify({"error": "X-Payment header missing payload or signature"}), 400
+
+    payload   = payment_proof["payload"]
+    signature = payment_proof["signature"]
+
+    nonce = payload.get("nonce")
+
+    if not nonce:
+        return jsonify({"error": "Payment payload missing nonce"}), 400
+
+    if nonce not in issued_nonces:
+        return jsonify({"error": "Nonce not recognised"}), 400
+
+    if nonce in used_nonces:
+        return jsonify({"error": "Nonce already used — possible replay attack"}), 400
+
+    if not verify_signature(payload, signature):
+        return jsonify({"error": "Invalid payment signature"}), 401
+
+    if payload.get("fee") != PORTFOLIO_FEE:
+        return jsonify({
+            "error": f"Incorrect fee. Expected {PORTFOLIO_FEE}, "
+                     f"received {payload.get('fee')}"
+        }), 400
+
+    # ── All checks passed ─────────────────────────────────────
+    used_nonces.add(nonce)
+
+    holdings  = get_portfolio()
+    positions = get_position_count()
+
+    response = {
+        "status":          "OK",
+        "positions":       positions,
+        "holdings":        holdings,
+        "fee_paid":        PORTFOLIO_FEE,
+        "currency":        FEE_CURRENCY,
+        "timestamp":       datetime.now(timezone.utc).isoformat(),
+    }
+
+    print(f"\n[Server] Portfolio served ✓ | {positions} open position(s)")
+    return jsonify(response), 200
+
 if __name__ == "__main__":
     print("\n[Server] AgentTrade Brokerage Server starting...")
     print(f"[Server] Listening on http://127.0.0.1:5000")

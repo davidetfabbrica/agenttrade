@@ -174,6 +174,102 @@ def execute_trade(ticker: str, direction: str, quantity: float,
 #
 # It places three trades in sequence so you can watch the wallet
 # balance deplete and see the full flow repeated.
+
+def fetch_portfolio(wallet: MockWallet) -> dict | None:
+    """
+    Requests the agent's current portfolio from the brokerage server.
+    Handles the x402 payment flow identically to execute_trade.
+
+    wallet: the agent's MockWallet instance
+
+    Returns the portfolio dict on success, or None on failure.
+    """
+    url = BROKERAGE_URL + "/portfolio"
+
+    print(f"\n[Agent] ── Portfolio Request ─────────────────────────")
+    print(f"[Agent] Sending to: {url}")
+
+    for attempt in range(1, MAX_RETRIES + 1):
+
+        print(f"\n[Agent] Attempt {attempt} of {MAX_RETRIES}")
+
+        headers = {"Content-Type": "application/json"}
+
+        try:
+            response = requests.get(url, headers=headers)
+        except requests.exceptions.ConnectionError:
+            print(f"[Agent] ERROR: Could not connect to {url}")
+            return None
+
+        print(f"[Agent] Server responded with status: {response.status_code}")
+
+        # ── Handle 402 ────────────────────────────────────────
+        if response.status_code == 402:
+
+            payment_instructions = response.json()
+            nonce     = payment_instructions["nonce"]
+            fee       = payment_instructions["fee"]
+            currency  = payment_instructions["currency"]
+            recipient = payment_instructions["recipient"]
+
+            print(f"[Agent] 402 received. Fee required: {fee} {currency}")
+
+            if not wallet.has_sufficient_funds(fee):
+                print(f"[Agent] Insufficient funds. "
+                      f"Balance: {wallet.balance:.2f}, Required: {fee}")
+                return None
+
+            payment_proof = wallet.sign_payment(
+                fee=fee,
+                currency=currency,
+                recipient=recipient,
+                nonce=nonce,
+            )
+
+            headers["X-Payment"] = json.dumps(payment_proof)
+
+            print(f"[Agent] Payment proof attached. Retrying...")
+
+            try:
+                response = requests.get(url, headers=headers)
+            except requests.exceptions.ConnectionError:
+                print(f"[Agent] ERROR: Lost connection on retry.")
+                return None
+
+            print(f"[Agent] Server responded with status: {response.status_code}")
+
+        # ── Handle 200 ────────────────────────────────────────
+        if response.status_code == 200:
+
+            data = response.json()
+
+            # Portfolio queries cost half the trade fee
+            portfolio_fee = round(TRADE_FEE / 2, 2)
+            wallet.deduct(portfolio_fee, "PORTFOLIO-QUERY")
+
+            print(f"\n[Agent] ── Portfolio Retrieved ✓ ──────────────────────")
+            print(f"[Agent] Open positions: {data['positions']}")
+
+            if data["positions"] == 0:
+                print(f"[Agent] No open positions.")
+            else:
+                for ticker, pos in data["holdings"].items():
+                    print(f"[Agent]   {ticker:6} | {pos['direction']:5} | "
+                          f"Qty: {pos['quantity']:>8} | "
+                          f"Avg: ${pos['avg_price']:>8.2f} | "
+                          f"Value: ${pos['market_value']:>10.2f}")
+
+            print(f"[Agent] Fee paid: {data['fee_paid']} {data['currency']}")
+            return data
+
+        if response.status_code not in (200, 402):
+            error_detail = response.json().get("error", "Unknown error")
+            print(f"[Agent] ERROR {response.status_code}: {error_detail}")
+            return None
+
+    print(f"[Agent] Failed to retrieve portfolio after {MAX_RETRIES} attempts.")
+    return None
+
 if __name__ == "__main__":
 
     print("═" * 55)
@@ -198,7 +294,8 @@ if __name__ == "__main__":
         result = execute_trade(ticker, direction, quantity, wallet)
         if result:
             results.append(result)
-
+# Fetch the portfolio after all trades are complete
+    fetch_portfolio(wallet)
     # Print the wallet statement at the end to show all fees paid.
     wallet.print_statement()
 
