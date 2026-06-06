@@ -1,91 +1,82 @@
 # wallet/mock_wallet.py
 # ─────────────────────────────────────────────────────────────
-# A simulated crypto wallet for the trading agent.
+# Simulated crypto wallet using real ECDSA signing.
 #
-# In a real x402 system, the wallet would:
-#   1. Hold actual USDC on a blockchain (e.g. Base, Ethereum)
-#   2. Sign payment authorisations using a real private key
-#      via elliptic curve cryptography (ECDSA)
-#   3. Broadcast signed transactions to the network
+# Previously used HMAC-style signing (SHA256 + shared secret).
+# This version uses proper public/private key cryptography:
 #
-# Here we simulate all three behaviours without touching a
-# blockchain. The concepts — signing, balance checks,
-# transaction logs — are identical to the real thing.
+#   - The private key signs payment authorisations
+#   - The public key (shared with the server) verifies them
+#   - The private key never leaves this file
+#
+# This matches how real x402 wallets work — the server only
+# ever needs the public key to verify a payment.
 # ─────────────────────────────────────────────────────────────
 
-import hashlib   # Built-in Python library for hashing
-import json      # Built-in library for working with JSON data
-import uuid      # Built-in library for generating unique IDs
-from datetime import datetime, timezone  # For timestamping transactions
+import json
+import uuid
+from datetime import datetime, timezone
 
-from shared.config import AGENT_STARTING_BALANCE, AGENT_PRIVATE_KEY
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import (
+    decode_dss_signature
+)
+from cryptography.hazmat.primitives import hashes, serialization
+import base64
+
+from shared.config import (
+    AGENT_STARTING_BALANCE,
+    AGENT_PRIVATE_KEY_PEM,
+)
 
 
 class MockWallet:
     """
-    Simulates a crypto wallet that can sign payment authorisations
-    and track a running balance.
-
-    A class is the right structure here because a wallet has both
-    data (balance, transaction history) and behaviour (sign, deduct).
+    A wallet that signs payment authorisations using ECDSA.
+    The private key signs; the server verifies with the public key.
     """
 
     def __init__(self):
-        """
-        Called automatically when you create a new MockWallet().
-        Sets the starting balance and creates an empty transaction log.
-        """
         self.balance = AGENT_STARTING_BALANCE
-        self.transaction_log = []  # A list that grows with each payment
+        self.transaction_log = []
 
-        print(f"[Wallet] Initialised with {self.balance:.2f} {' mock USDC'}")
+        # Load the private key from PEM format
+        # This happens once at startup — not on every signing operation
+        self._private_key = serialization.load_pem_private_key(
+            AGENT_PRIVATE_KEY_PEM.strip().encode(),
+            password=None,
+        )
+
+        print(f"[Wallet] Initialised with {self.balance:.2f} mock USDC")
+        print(f"[Wallet] ECDSA signing active (SECP256K1)")
 
 
     def has_sufficient_funds(self, amount: float) -> bool:
-        """
-        Returns True if the wallet has enough balance to cover the fee.
-        We check this before attempting to sign — no point signing
-        a payment we can't afford.
-        """
+        """Returns True if the wallet balance covers the fee."""
         return self.balance >= amount
 
 
     def sign_payment(self, fee: float, currency: str,
                      recipient: str, nonce: str) -> dict:
         """
-        Creates a signed payment authorisation.
+        Signs a payment authorisation using ECDSA with the private key.
 
-        In real crypto, 'signing' means applying your private key to
-        a hash of the payment data using ECDSA. The result proves you
-        authorised this exact payment without revealing your private key.
+        The signature is produced by:
+          1. Building a canonical JSON string of the payment payload
+          2. Signing it with the private key using ECDSA + SHA256
+          3. Encoding the signature as base64 for safe transport in headers
 
-        Here we simulate that by:
-          1. Building a string from the payment details
-          2. Hashing it together with the mock private key using SHA-256
-          3. Using that hash as the 'signature'
+        The server verifies using only the public key —
+        the private key is never transmitted.
 
-        The server can verify this by performing the same hash and
-        comparing the result — exactly as real signature verification works.
-
-        fee:       the amount being paid
-        currency:  e.g. "USDC"
-        recipient: the brokerage wallet address
-        nonce:     a one-time token from the server (prevents replay attacks)
-
-        Returns a dictionary representing the payment proof.
+        Returns a dict containing the payload and the base64 signature.
         """
-
         if not self.has_sufficient_funds(fee):
-            # Raise an exception rather than returning silently.
-            # In trading systems, silent failures are dangerous.
             raise ValueError(
                 f"[Wallet] Insufficient funds. "
                 f"Balance: {self.balance:.2f}, Required: {fee:.2f}"
             )
 
-        # Build the payload — the exact data we're authorising.
-        # Every field matters. Changing any one of them produces a
-        # completely different hash (that's the point of hashing).
         payment_payload = {
             "fee":       fee,
             "currency":  currency,
@@ -93,44 +84,39 @@ class MockWallet:
             "nonce":     nonce,
         }
 
-        # Convert the payload to a consistent string for hashing.
-        # sort_keys=True ensures the order is always the same,
-        # regardless of how Python internally stores the dictionary.
+        # Canonical JSON — sort_keys ensures consistent ordering
         payload_string = json.dumps(payment_payload, sort_keys=True)
 
-        # Create the signature by hashing the payload + private key together.
-        # SHA-256 produces a fixed 64-character hex string from any input.
-        # We concatenate the private key so only someone with the key
-        # can produce a valid signature — same principle as real crypto.
-        raw = payload_string + AGENT_PRIVATE_KEY
-        signature = hashlib.sha256(raw.encode()).hexdigest()
+        # Sign the payload bytes using ECDSA with SHA256
+        # ECDSA produces a different signature each time (it includes
+        # a random component) — unlike our previous HMAC approach.
+        # This is normal and correct behaviour.
+        signature_bytes = self._private_key.sign(
+            payload_string.encode(),
+            ec.ECDSA(hashes.SHA256())
+        )
 
-        # Build the complete payment proof that will be sent to the server.
+        # Encode signature as base64 so it's safe to put in an HTTP header
+        signature_b64 = base64.b64encode(signature_bytes).decode()
+
         payment_proof = {
             "payload":   payment_payload,
-            "signature": signature,
+            "signature": signature_b64,
         }
 
-        print(f"[Wallet] Payment signed. Fee: {fee} {currency} | Nonce: {nonce}")
-        print(f"[Wallet] Signature: {signature[:20]}...") # Only show the start — it's long
+        print(f"[Wallet] Payment signed (ECDSA). "
+              f"Fee: {fee} {currency} | Nonce: {nonce}")
+        print(f"[Wallet] Signature: {signature_b64[:20]}...")
 
         return payment_proof
 
 
     def deduct(self, amount: float, trade_ref: str) -> None:
-        """
-        Deducts a fee from the balance and records it in the transaction log.
-        Only called after the server confirms the trade was successful.
-
-        amount:    the fee amount to deduct
-        trade_ref: the trade reference number, for the log
-        """
+        """Deducts a fee and logs the transaction."""
         self.balance -= amount
 
-        # Record the transaction with a timestamp.
-        # This is the same pattern used in real ledger systems.
         log_entry = {
-            "transaction_id": str(uuid.uuid4()),  # Unique ID for this log entry
+            "transaction_id": str(uuid.uuid4()),
             "trade_ref":      trade_ref,
             "amount_paid":    amount,
             "balance_after":  round(self.balance, 2),
@@ -138,16 +124,12 @@ class MockWallet:
         }
 
         self.transaction_log.append(log_entry)
-
         print(f"[Wallet] Deducted {amount} USDC. "
               f"Remaining balance: {self.balance:.2f} USDC")
 
 
     def print_statement(self) -> None:
-        """
-        Prints a summary of all transactions to the terminal.
-        Useful for reviewing what the agent spent during a run.
-        """
+        """Prints all transactions to the terminal."""
         print("\n[Wallet] ── Transaction Statement ──────────────────")
         if not self.transaction_log:
             print("[Wallet] No transactions recorded.")

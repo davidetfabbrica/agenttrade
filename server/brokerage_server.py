@@ -28,8 +28,8 @@ from shared.config import (
     TRADE_FEE,
     FEE_CURRENCY,
     BROKERAGE_WALLET_ADDRESS,
-    AGENT_PRIVATE_KEY,
 )
+
 from data.market_prices import get_price
 from data.portfolio_store import get_portfolio, update_position, get_position_count
 
@@ -51,7 +51,8 @@ app = Flask(__name__)
 # In production this would be a database or Redis cache.
 issued_nonces = set()    # Nonces the server has issued
 used_nonces = set()      # Nonces that have already been spent
-
+# In-memory trade history for the dashboard
+trade_history = []
 
 # ── Helper: generate a nonce ──────────────────────────────────
 def generate_nonce() -> str:
@@ -68,33 +69,47 @@ def generate_nonce() -> str:
 # ── Helper: verify payment signature ─────────────────────────
 def verify_signature(payload: dict, received_signature: str) -> bool:
     """
-    Verifies that the payment proof was signed by the legitimate agent.
+    Verifies an ECDSA signature using the agent's public key.
 
-    We recreate the signature using the same method the wallet used:
-      hash(JSON payload + private key)
+    The server loads the public key from config — it never needs
+    the private key. This is the core security improvement over
+    the previous HMAC approach.
 
-    If the result matches the received signature, the payment is valid.
-
-    IMPORTANT NOTE FOR PORTFOLIO REVIEWERS:
-    In production x402, the server would verify using the agent's
-    PUBLIC key only — the private key never leaves the agent's wallet.
-    This demo uses a shared secret (HMAC-style) for simplicity.
-    Real implementations use ECDSA (Elliptic Curve Digital Signature
-    Algorithm) as specified in the x402 protocol documentation.
+    received_signature is a base64-encoded ECDSA signature.
+    Returns True if valid, False if not.
     """
-    # Recreate the exact string the wallet hashed
-    payload_string = json.dumps(payload, sort_keys=True)
-    raw = payload_string + AGENT_PRIVATE_KEY
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.exceptions import InvalidSignature
+    import base64
+    from shared.config import AGENT_PUBLIC_KEY_PEM
 
-    # Compute what the signature should be
-    expected_signature = hashlib.sha256(raw.encode()).hexdigest()
+    try:
+        # Load the public key
+        public_key = serialization.load_pem_public_key(
+            AGENT_PUBLIC_KEY_PEM.strip().encode()
+        )
 
-    # Compare securely
-    # Note: we use == here for simplicity. In production you would use
-    # hmac.compare_digest() to prevent timing attacks — a real attack
-    # where an adversary measures how long comparison takes to guess
-    # the signature one character at a time.
-    return received_signature == expected_signature
+        # Recreate the exact payload string that was signed
+        payload_string = json.dumps(payload, sort_keys=True)
+
+        # Decode the base64 signature back to bytes
+        signature_bytes = base64.b64decode(received_signature)
+
+        # Verify — raises InvalidSignature if it doesn't match
+        public_key.verify(
+            signature_bytes,
+            payload_string.encode(),
+            ec.ECDSA(hashes.SHA256())
+        )
+
+        return True
+
+    except InvalidSignature:
+        return False
+    except Exception as e:
+        print(f"[Server] Signature verification error: {e}")
+        return False
 
 
 # ── Helper: validate trade request body ──────────────────────
@@ -248,9 +263,25 @@ def execute_trade():
     trade_value = round(fill_price * quantity, 2)
 
     # Generate a unique trade reference number
-    trade_ref = f"TRD-{str(uuid.uuid4())[:8].upper()}"
+    trade_ref   = f"TRD-{str(uuid.uuid4())[:8].upper()}"
+    trade_value = round(fill_price * quantity, 2)
+
     # Update the portfolio store with the filled trade
     update_position(ticker, direction, quantity, fill_price)
+
+    # Record the complete trade for the dashboard.
+    # We build the full entry here rather than appending a partial
+    # entry and updating it — that approach caused an index error.
+    trade_history.append({
+        "trade_ref":   trade_ref,
+        "ticker":      ticker,
+        "direction":   direction,
+        "quantity":    quantity,
+        "fill_price":  fill_price,
+        "trade_value": trade_value,
+        "fee_paid":    TRADE_FEE,
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+    })
 
     # Build the confirmation response
     confirmation = {
@@ -368,6 +399,46 @@ def portfolio():
 
     print(f"\n[Server] Portfolio served ✓ | {positions} open position(s)")
     return jsonify(response), 200
+
+# ── Endpoint: GET /dashboard ──────────────────────────────────
+# Serves the dashboard HTML page.
+# No payment required — it's a monitoring view, not a data API.
+@app.route("/dashboard")
+def dashboard():
+    """Serves the dashboard HTML template."""
+    from flask import render_template
+    return render_template("dashboard.html")
+
+
+# ── Endpoint: GET /dashboard-data ────────────────────────────
+# Returns current server state as JSON for the dashboard to render.
+# Called by the dashboard JavaScript every 3 seconds.
+@app.route("/dashboard-data")
+def dashboard_data():
+    """
+    Returns a JSON snapshot of current server state:
+    - Trade history
+    - Portfolio holdings
+    - Wallet summary (balance and total fees)
+    """
+    from data.portfolio_store import get_portfolio
+
+    # Calculate total fees from trade history
+    total_fees = round(
+        sum(t["fee_paid"] for t in trade_history), 2
+    )
+
+    # Derive wallet balance from starting balance minus all fees
+    from shared.config import AGENT_STARTING_BALANCE
+    wallet_balance = round(AGENT_STARTING_BALANCE - total_fees, 2)
+
+    return jsonify({
+        "trades":           trade_history,
+        "portfolio":        get_portfolio(),
+        "total_fees_paid":  total_fees,
+        "wallet_balance":   wallet_balance,
+        "timestamp":        datetime.now(timezone.utc).isoformat(),
+    })
 
 if __name__ == "__main__":
     print("\n[Server] AgentTrade Brokerage Server starting...")

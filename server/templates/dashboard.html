@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!--
+    AgentTrade Dashboard
+    A simple real-time view of the agent's trades and portfolio.
+
+    No external dependencies — pure HTML, CSS, and JavaScript.
+    The page polls the /dashboard-data endpoint every 3 seconds
+    and re-renders the tables without a full page reload.
+
+    Polling is the simplest approach for a demo. A production
+    system would use WebSockets for true real-time updates.
+  -->
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AgentTrade — Dashboard</title>
+  <style>
+    /* ── Reset and base ──────────────────────────────────── */
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+      padding: 2rem;
+    }
+
+    /* ── Layout ──────────────────────────────────────────── */
+    .header {
+      margin-bottom: 2rem;
+      border-bottom: 1px solid #2d3748;
+      padding-bottom: 1rem;
+    }
+
+    .header h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+      color: #ffffff;
+    }
+
+    .header p {
+      color: #718096;
+      font-size: 0.875rem;
+      margin-top: 0.25rem;
+    }
+
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #48bb78;
+      margin-right: 0.5rem;
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+
+    /* ── Stat cards ──────────────────────────────────────── */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .stat-card {
+      background: #1a202c;
+      border: 1px solid #2d3748;
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+    }
+
+    .stat-card .label {
+      font-size: 0.75rem;
+      color: #718096;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.375rem;
+    }
+
+    .stat-card .value {
+      font-size: 1.5rem;
+      font-weight: 600;
+      color: #ffffff;
+    }
+
+    .stat-card .value.green { color: #48bb78; }
+    .stat-card .value.amber { color: #ed8936; }
+
+    /* ── Panels ──────────────────────────────────────────── */
+    .panel {
+      background: #1a202c;
+      border: 1px solid #2d3748;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      padding: 0.875rem 1.25rem;
+      border-bottom: 1px solid #2d3748;
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: #a0aec0;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    /* ── Tables ──────────────────────────────────────────── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+    }
+
+    th {
+      padding: 0.625rem 1.25rem;
+      text-align: left;
+      font-size: 0.75rem;
+      color: #718096;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid #2d3748;
+    }
+
+    td {
+      padding: 0.75rem 1.25rem;
+      border-bottom: 1px solid #1e2533;
+      color: #cbd5e0;
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    tr:hover td {
+      background: #232b3a;
+    }
+
+    /* ── Direction badges ────────────────────────────────── */
+    .badge {
+      display: inline-block;
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+    }
+
+    .badge.long,
+    .badge.buy  { background: #1c4532; color: #68d391; }
+
+    .badge.short,
+    .badge.sell { background: #4a1c1c; color: #fc8181; }
+
+    /* ── Empty state ─────────────────────────────────────── */
+    .empty {
+      padding: 2rem;
+      text-align: center;
+      color: #4a5568;
+      font-size: 0.875rem;
+    }
+
+    /* ── Footer ──────────────────────────────────────────── */
+    .footer {
+      margin-top: 2rem;
+      padding-top: 1rem;
+      border-top: 1px solid #2d3748;
+      font-size: 0.75rem;
+      color: #4a5568;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h1><span class="status-dot"></span>AgentTrade Dashboard</h1>
+    <p>x402 Agentic Payment Demo — live trade and portfolio data</p>
+  </div>
+
+  <!-- ── Stat cards ──────────────────────────────────────── -->
+  <div class="stats">
+    <div class="stat-card">
+      <div class="label">Trades Filled</div>
+      <div class="value green" id="stat-trades">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Open Positions</div>
+      <div class="value" id="stat-positions">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Fees Paid (USDC)</div>
+      <div class="value amber" id="stat-fees">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Wallet Balance</div>
+      <div class="value green" id="stat-balance">—</div>
+    </div>
+  </div>
+
+  <!-- ── Main grid ───────────────────────────────────────── -->
+  <div class="grid">
+
+    <!-- Portfolio panel -->
+    <div class="panel">
+      <div class="panel-header">Portfolio Holdings</div>
+      <div id="portfolio-content">
+        <div class="empty">No positions yet — run the agent to populate.</div>
+      </div>
+    </div>
+
+    <!-- Transaction log panel -->
+    <div class="panel">
+      <div class="panel-header">Transaction Log</div>
+      <div id="transaction-content">
+        <div class="empty">No transactions yet.</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Trade history panel ─────────────────────────────── -->
+  <div class="panel">
+    <div class="panel-header">Trade History</div>
+    <div id="trades-content">
+      <div class="empty">No trades yet — run the agent to populate.</div>
+    </div>
+  </div>
+
+  <div class="footer">
+    Auto-refreshes every 3 seconds &nbsp;·&nbsp;
+    Data served from <code>http://127.0.0.1:5000/dashboard-data</code>
+  </div>
+
+  <script>
+    /**
+     * Fetches data from /dashboard-data and re-renders all panels.
+     * Called on load and then every 3 seconds.
+     */
+    async function refresh() {
+      try {
+        const res  = await fetch("/dashboard-data");
+        const data = await res.json();
+        renderStats(data);
+        renderPortfolio(data.portfolio);
+        renderTransactions(data.trades);
+        renderTrades(data.trades);
+      } catch (e) {
+        // Server not reachable — fail silently, try again next tick
+        console.warn("Dashboard refresh failed:", e);
+      }
+    }
+
+    /** Renders the four stat cards at the top */
+    function renderStats(data) {
+      document.getElementById("stat-trades").textContent =
+        data.trades.length;
+      document.getElementById("stat-positions").textContent =
+        Object.keys(data.portfolio).length;
+      document.getElementById("stat-fees").textContent =
+        data.total_fees_paid.toFixed(2);
+      document.getElementById("stat-balance").textContent =
+        data.wallet_balance.toFixed(2);
+    }
+
+    /** Renders the portfolio holdings table */
+    function renderPortfolio(portfolio) {
+      const el = document.getElementById("portfolio-content");
+      const tickers = Object.keys(portfolio);
+
+      if (tickers.length === 0) {
+        el.innerHTML = '<div class="empty">No open positions.</div>';
+        return;
+      }
+
+      // Build table rows from portfolio data
+      const rows = tickers.map(ticker => {
+        const p = portfolio[ticker];
+        const dirClass = p.direction.toLowerCase();
+        return `
+          <tr>
+            <td><strong>${ticker}</strong></td>
+            <td><span class="badge ${dirClass}">${p.direction}</span></td>
+            <td>${Math.abs(p.quantity)}</td>
+            <td>$${p.avg_price.toFixed(2)}</td>
+            <td>$${p.market_value.toFixed(2)}</td>
+          </tr>`;
+      }).join("");
+
+      el.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Ticker</th>
+              <th>Direction</th>
+              <th>Quantity</th>
+              <th>Avg Price</th>
+              <th>Market Value</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+
+    /** Renders the transaction log table */
+    function renderTransactions(transactions) {
+      const el = document.getElementById("transaction-content");
+
+      if (transactions.length === 0) {
+        el.innerHTML = '<div class="empty">No transactions yet.</div>';
+        return;
+      }
+
+      // Show most recent first
+      const rows = [...transactions].reverse().map(t => `
+        <tr>
+          <td>${t.trade_ref}</td>
+          <td>${t.fee_paid} USDC</td>
+          <td>${t.direction} ${t.quantity} ${t.ticker}</td>
+          <td style="color:#718096;font-size:0.75rem">
+            ${new Date(t.timestamp).toLocaleTimeString()}
+          </td>
+        </tr>`).join("");
+
+      el.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Reference</th>
+              <th>Fee Paid</th>
+              <th>Trade</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+
+    /** Renders the trade history table */
+    function renderTrades(trades) {
+      const el = document.getElementById("trades-content");
+
+      if (trades.length === 0) {
+        el.innerHTML = '<div class="empty">No trades yet.</div>';
+        return;
+      }
+
+      const rows = [...trades].reverse().map(t => {
+        const dirClass = t.direction.toLowerCase();
+        return `
+          <tr>
+            <td><code>${t.trade_ref}</code></td>
+            <td><strong>${t.ticker}</strong></td>
+            <td><span class="badge ${dirClass}">${t.direction}</span></td>
+            <td>${t.quantity}</td>
+            <td>$${t.fill_price.toFixed(2)}</td>
+            <td>$${t.trade_value.toFixed(2)}</td>
+            <td>${t.fee_paid} USDC</td>
+            <td style="color:#718096;font-size:0.75rem">
+              ${new Date(t.timestamp).toLocaleTimeString()}
+            </td>
+          </tr>`;
+      }).join("");
+
+      el.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Reference</th>
+              <th>Ticker</th>
+              <th>Direction</th>
+              <th>Quantity</th>
+              <th>Fill Price</th>
+              <th>Trade Value</th>
+              <th>Fee</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+
+    // Initial load, then poll every 3 seconds
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+
+</body>
+</html>
