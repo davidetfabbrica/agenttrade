@@ -285,7 +285,7 @@ if __name__ == "__main__":
     trades = [
         ("AAPL",  "BUY",  10),
         ("NVDA",  "BUY",   5),
-        ("BRK.B", "SELL",  20),
+        ("TSLA",  "SELL",  20),
     ]
 
     results = []
